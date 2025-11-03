@@ -1,234 +1,304 @@
 import os
 import sys
 from datetime import datetime
-from typing import Dict
+from typing import Dict, Tuple
 
-import monai
-import pytz
 import torch
 import yaml
 from accelerate import Accelerator
 from easydict import EasyDict
-from monai.utils import ensure_tuple_rep
 from objprint import objstr
-from timm.optim import optim_factory
+from torch.utils.data import DataLoader
 
-from src import utils
-from src.models import give_model
-from src.optimizer import LinearWarmupCosineAnnealingLR
-from src.utils import Logger, load_pretrain_model
-import warnings
-warnings.filterwarnings('ignore')
+from src.fttransformer import FTTransformer
+from src.tabular_data import TabularMetadata, build_datasets, merge_tables
+from src.utils import Logger, same_seeds
 
-def train_one_epoch(model: torch.nn.Module, loss_functions: Dict[str, torch.nn.modules.loss._Loss],
-                    train_loader: torch.utils.data.DataLoader,
-                    optimizer: torch.optim.Optimizer, scheduler: torch.optim.lr_scheduler._LRScheduler,
-                    metrics: Dict[str, monai.metrics.CumulativeIterationMetric],
-                    post_trans: monai.transforms.Compose, accelerator: Accelerator, epoch: int, step: int):
-    # 训练
+
+def prepare_batch(batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor], accelerator: Accelerator):
+    x_cont, x_cat, targets = batch
+    x_cont_tensor = x_cont.to(accelerator.device) if x_cont.shape[1] > 0 else None
+    x_cat_tensor = x_cat.to(accelerator.device) if x_cat.shape[1] > 0 else None
+    targets_tensor = targets.to(accelerator.device)
+    return x_cont_tensor, x_cat_tensor, targets_tensor
+
+
+def train_one_epoch(
+    model: torch.nn.Module,
+    train_loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    loss_fn: torch.nn.Module,
+    accelerator: Accelerator,
+    epoch: int,
+    step: int,
+    num_epochs: int,
+) -> Tuple[int, float, float]:
     model.train()
-    for i, image_batch in enumerate(train_loader):
-        logits = model(image_batch[0])
-        total_loss = 0
-        log = ''
-        for name in loss_functions:
-            alpth = 1
-            loss = loss_functions[name](logits, image_batch[1])
-            accelerator.log({'Train/' + name: float(loss)}, step=step)
-            total_loss += alpth * loss
-        val_outputs = post_trans(logits)
-        for metric_name in metrics:
-            metrics[metric_name](y_pred=val_outputs, y=image_batch[1])
+    total_loss = 0.0
+    total_correct = 0
+    total_samples = 0
 
-        accelerator.backward(total_loss)
-        optimizer.step()
-        optimizer.zero_grad()
+    for batch_idx, batch in enumerate(train_loader):
+        x_cont, x_cat, targets = prepare_batch(batch, accelerator)
+        with accelerator.accumulate(model):
+            logits = model(x_cont, x_cat)
+            loss = loss_fn(logits, targets)
+            accelerator.backward(loss)
+            optimizer.step()
+            optimizer.zero_grad()
+
+        step += 1
+
+        gathered_loss = accelerator.gather_for_metrics(loss.detach() * targets.size(0))
+        gathered_targets = accelerator.gather_for_metrics(targets)
+        gathered_preds = accelerator.gather_for_metrics(logits.argmax(dim=-1))
+
+        batch_size = gathered_targets.shape[0]
+        loss_value = gathered_loss.sum().item() / max(batch_size, 1)
+        correct = (gathered_preds == gathered_targets).sum().item()
+        accuracy_value = correct / batch_size if batch_size else 0.0
+
+        total_loss += gathered_loss.sum().item()
+        total_correct += correct
+        total_samples += batch_size
 
         accelerator.log({
-            'Train/Total Loss': float(total_loss),
+            "Train/Total Loss": loss_value,
+            "Train/Accuracy": accuracy_value,
         }, step=step)
         accelerator.print(
-            f'Epoch [{epoch + 1}/{config.trainer.num_epochs}] Training [{i + 1}/{len(train_loader)}] Loss: {total_loss:1.5f} {log}',
-            flush=True)
-        step += 1
-        # break
-    scheduler.step(epoch)
-    metric = {}
-    for metric_name in metrics:
-        batch_acc = metrics[metric_name].aggregate()[0].to(accelerator.device)
-        if accelerator.num_processes > 1:
-            batch_acc = accelerator.reduce(batch_acc) / accelerator.num_processes
-        metric.update({
-        f'Train/mean {metric_name}': float(batch_acc.mean())})
-        
-    accelerator.print(f'Epoch [{epoch + 1}/{config.trainer.num_epochs}] Training metric {metric}')
-    accelerator.log(metric, step=epoch)
-    return step
+            f"Epoch [{epoch + 1}/{num_epochs}] Training [{batch_idx + 1}/{len(train_loader)}] "
+            f"Loss: {loss_value:.4f} Acc: {accuracy_value:.4%}",
+            flush=True,
+        )
+
+    if total_samples == 0:
+        return step, 0.0, 0.0
+
+    mean_loss = total_loss / total_samples
+    mean_accuracy = total_correct / total_samples
+    accelerator.log({
+        "Train/mean loss": mean_loss,
+        "Train/mean accuracy": mean_accuracy,
+    }, step=epoch)
+    accelerator.print(
+        f"Epoch [{epoch + 1}/{num_epochs}] Training summary Loss: {mean_loss:.4f} Acc: {mean_accuracy:.4%}",
+        flush=True,
+    )
+    return step, mean_loss, mean_accuracy
 
 
 @torch.no_grad()
-def val_one_epoch(model: torch.nn.Module, loss_functions: Dict[str, torch.nn.modules.loss._Loss],
-                  inference: monai.inferers.Inferer, val_loader: torch.utils.data.DataLoader,
-                  config: EasyDict, metrics: Dict[str, monai.metrics.CumulativeIterationMetric], step: int,
-                  post_trans: monai.transforms.Compose, accelerator: Accelerator, epoch: int):
-    # 验证
+def validate(
+    model: torch.nn.Module,
+    val_loader: DataLoader,
+    loss_fn: torch.nn.Module,
+    accelerator: Accelerator,
+    epoch: int,
+    step: int,
+    num_epochs: int,
+) -> Tuple[float, Dict[str, float], int]:
     model.eval()
-    for i, image_batch in enumerate(val_loader):
-        logits = inference(image_batch[0], model)
-        total_loss = 0
-        log = ''
-        for name in loss_functions:
-            loss = loss_functions[name](logits, image_batch[1])
-            accelerator.log({'Val/' + name: float(loss)}, step=step)
-            log += f' {name} {float(loss):1.5f} '
-            total_loss += loss
-        val_outputs = post_trans(logits)
-        for metric_name in metrics:
-            metrics[metric_name](y_pred=val_outputs, y=image_batch[1])
+    total_loss = 0.0
+    total_correct = 0
+    total_samples = 0
+
+    for batch_idx, batch in enumerate(val_loader):
+        x_cont, x_cat, targets = prepare_batch(batch, accelerator)
+        logits = model(x_cont, x_cat)
+        loss = loss_fn(logits, targets)
+
+        step += 1
+
+        gathered_loss = accelerator.gather_for_metrics(loss.detach() * targets.size(0))
+        gathered_targets = accelerator.gather_for_metrics(targets)
+        gathered_preds = accelerator.gather_for_metrics(logits.argmax(dim=-1))
+
+        batch_size = gathered_targets.shape[0]
+        loss_value = gathered_loss.sum().item() / max(batch_size, 1)
+        correct = (gathered_preds == gathered_targets).sum().item()
+        accuracy_value = correct / batch_size if batch_size else 0.0
+
+        total_loss += gathered_loss.sum().item()
+        total_correct += correct
+        total_samples += batch_size
+
         accelerator.log({
-            'Val/Total Loss': float(total_loss),
+            "Val/Total Loss": loss_value,
+            "Val/Accuracy": accuracy_value,
         }, step=step)
         accelerator.print(
-            f'Epoch [{epoch + 1}/{config.trainer.num_epochs}] Validation [{i + 1}/{len(val_loader)}] Loss: {total_loss:1.5f} {log}',
-            flush=True)
-        step += 1
-    metric = {}
-    if config.trainer.dataset_choose != 'EDD_seg':
-        for metric_name in metrics:
-            batch_acc = metrics[metric_name].aggregate()[0].to(accelerator.device)
-            if accelerator.num_processes > 1:
-                batch_acc = accelerator.reduce(batch_acc) / accelerator.num_processes
-            metrics[metric_name].reset()
-            metric.update({
-            f'Val/mean {metric_name}': float(batch_acc.mean())})
-            
-        accelerator.print(f'Epoch [{epoch + 1}/{config.trainer.num_epochs}] Validation metric {metric}')
-        accelerator.log(metric, step=epoch)
-    else:
-        for metric_name in metrics:
-            batch_acc = metrics[metric_name].aggregate()[0].to(accelerator.device)
-            if accelerator.num_processes > 1:
-                batch_acc = accelerator.reduce(batch_acc) / accelerator.num_processes
-            metrics[metric_name].reset()
-            if batch_acc.size()==torch.Size([]) or batch_acc.size()==torch.Size([1]):
-                metric.update({
-                    f'Val/mean {metric_name}': float(batch_acc.mean()),
-                    })
-            else:
-                metric.update({
-                    f'Val/mean {metric_name}': float(batch_acc.mean()),
-                    f'Val/BE {metric_name}': float(batch_acc[0]),
-                    f'Val/cancer {metric_name}': float(batch_acc[1]),
-                    f'Val/HGD {metric_name}': float(batch_acc[2]),
-                    f'Val/polyp {metric_name}': float(batch_acc[3]),
-                    f'Val/suspicious {metric_name}': float(batch_acc[4])})
-    return torch.Tensor([metric['Val/mean dice_metric']]).to(accelerator.device), metric, step
+            f"Epoch [{epoch + 1}/{num_epochs}] Validation [{batch_idx + 1}/{len(val_loader)}] "
+            f"Loss: {loss_value:.4f} Acc: {accuracy_value:.4%}",
+            flush=True,
+        )
+
+    if total_samples == 0:
+        metrics = {"Val/mean loss": 0.0, "Val/mean accuracy": 0.0}
+        accelerator.log(metrics, step=epoch)
+        return 0.0, metrics, step
+
+    mean_loss = total_loss / total_samples
+    mean_accuracy = total_correct / total_samples
+    metrics = {"Val/mean loss": mean_loss, "Val/mean accuracy": mean_accuracy}
+    accelerator.log(metrics, step=epoch)
+    accelerator.print(
+        f"Epoch [{epoch + 1}/{num_epochs}] Validation summary Loss: {mean_loss:.4f} Acc: {mean_accuracy:.4%}",
+        flush=True,
+    )
+    return mean_accuracy, metrics, step
 
 
-if __name__ == '__main__':
-    config = EasyDict(yaml.load(open('config.yml', 'r', encoding="utf-8"), Loader=yaml.FullLoader))
-    utils.same_seeds(50)
-    logging_dir = os.getcwd() + '/logs/' + config.finetune.checkpoint +str(datetime.now())
-    accelerator = Accelerator(cpu=False, log_with=["tensorboard"], logging_dir=logging_dir)
+def create_model(metadata: TabularMetadata, model_config: EasyDict) -> FTTransformer:
+    backbone_kwargs = FTTransformer.get_default_kwargs(model_config.n_blocks)
+    overrides = dict(model_config.backbone_kwargs) if model_config.backbone_kwargs else {}
+    backbone_kwargs.update(overrides)
+    return FTTransformer(
+        n_cont_features=len(metadata.continuous_columns),
+        cat_cardinalities=list(metadata.categorical_cardinalities),
+        **backbone_kwargs,
+    )
+
+
+if __name__ == "__main__":
+    with open("config.yml", "r", encoding="utf-8") as config_file:
+        config = EasyDict(yaml.safe_load(config_file))
+
+    same_seeds(config.seed)
+
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    logging_dir = os.path.join(os.getcwd(), "logs", f"{config.trainer.run_name}_{timestamp}")
+    accelerator = Accelerator(
+        cpu=False,
+        gradient_accumulation_steps=config.trainer.gradient_accumulation_steps,
+        log_with=["tensorboard"],
+        logging_dir=logging_dir,
+        mixed_precision=config.trainer.mixed_precision,
+    )
     Logger(logging_dir if accelerator.is_local_main_process else None)
-    accelerator.init_trackers(os.path.split(__file__)[-1].split(".")[0])
+    accelerator.init_trackers(os.path.splitext(os.path.basename(__file__))[0])
     accelerator.print(objstr(config))
 
-    accelerator.print('Load Model...')
-    model = give_model(config)
-    
-    image_size = config.dataset.CVC_ClinicDB.image_size
+    accelerator.print("Load dataset...")
+    raw_table = merge_tables(
+        config.data.files,
+        label_column=config.data.label_column,
+        target_column=config.data.target_column,
+    )
+    train_dataset, val_dataset, metadata = build_datasets(
+        raw_table,
+        label_column=config.data.label_column,
+        target_column=config.data.target_column,
+        val_ratio=config.data.val_ratio,
+        seed=config.seed,
+    )
 
-    accelerator.print('Load Dataloader...')
-    if config.trainer.dataset_choose == 'CVC_ClinicDB':
-        from src.CVCLoder import get_dataloader
-        train_loader, val_loader = get_dataloader(config,dataset_choose='CVC_ClinicDB')
-        include_background = False
-    elif config.trainer.dataset_choose == 'Kvasir_SEG':
-        from src.CVCLoder import get_dataloader
-        train_loader, val_loader = get_dataloader(config,dataset_choose='Kvasir_SEG')
-        include_background = False
-    elif config.trainer.dataset_choose == 'EDD_seg':
-        from src.EDDLoader import get_dataloader
-        train_loader, val_loader = get_dataloader(config)
-        include_background = True
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config.data.batch_size,
+        shuffle=True,
+        num_workers=config.data.num_workers,
+        pin_memory=True,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config.data.batch_size,
+        shuffle=False,
+        num_workers=config.data.num_workers,
+        pin_memory=True,
+    )
 
-    inference = monai.inferers.SlidingWindowInferer(roi_size=ensure_tuple_rep(image_size, 2), overlap=0.5,
-                                                    sw_device=accelerator.device, device=accelerator.device)
-    metrics = {
-        'dice_metric': monai.metrics.DiceMetric(include_background=include_background,
-                                                reduction=monai.utils.MetricReduction.MEAN_BATCH, get_not_nans=True),
-        'miou_metric':monai.metrics.MeanIoU(include_background=include_background),
-        'f1': monai.metrics.ConfusionMatrixMetric(include_background=include_background, metric_name='f1 score'),
-        'precision': monai.metrics.ConfusionMatrixMetric(include_background=include_background, metric_name="precision"),
-        'recall': monai.metrics.ConfusionMatrixMetric(include_background=include_background, metric_name="recall"),
-        'hd95_metric': monai.metrics.HausdorffDistanceMetric(percentile=95, include_background=include_background, reduction=monai.utils.MetricReduction.MEAN_BATCH, get_not_nans=True)
-    }
-    post_trans = monai.transforms.Compose([
-        monai.transforms.Activations(sigmoid=True), monai.transforms.AsDiscrete(threshold=0.5)
-    ])
+    accelerator.print(
+        f"Continuous features ({len(metadata.continuous_columns)}): {metadata.continuous_columns}"
+    )
+    accelerator.print(
+        f"Categorical features ({len(metadata.categorical_columns)}): {metadata.categorical_columns}"
+    )
 
-    # 定义训练参数
-    optimizer = optim_factory.create_optimizer_v2(model, opt=config.trainer.optimizer,
-                                                  weight_decay=config.trainer.weight_decay,
-                                                  lr=config.trainer.lr, betas=(0.9, 0.95))
-    scheduler = LinearWarmupCosineAnnealingLR(optimizer, warmup_epochs=config.trainer.warmup,
-                                              max_epochs=config.trainer.num_epochs)
-    loss_functions = {
-        'focal_loss': monai.losses.FocalLoss(to_onehot_y=False),
-        'dice_loss': monai.losses.DiceLoss(smooth_nr=0, smooth_dr=1e-5, to_onehot_y=False, sigmoid=True),
-    }
+    model = create_model(metadata, config.model)
+    optimizer = torch.optim.AdamW(
+        model.make_parameter_groups(),
+        lr=config.optimizer.lr,
+        weight_decay=config.optimizer.weight_decay,
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=config.trainer.num_epochs
+    )
+    loss_fn = torch.nn.CrossEntropyLoss()
 
-    step = 0
-    best_eopch = -1
-    val_step = 0
+    model, optimizer, train_loader, val_loader, scheduler = accelerator.prepare(
+        model, optimizer, train_loader, val_loader, scheduler
+    )
+
+    checkpoint_root = os.path.join(os.getcwd(), "model_store", config.trainer.output_dir)
+    best_dir = os.path.join(checkpoint_root, "best")
+    checkpoint_dir = os.path.join(checkpoint_root, "checkpoint")
+    if accelerator.is_main_process:
+        os.makedirs(best_dir, exist_ok=True)
+        os.makedirs(checkpoint_dir, exist_ok=True)
+    accelerator.wait_for_everyone()
+
+    best_acc = 0.0
+    best_metrics: Dict[str, float] = {}
+    best_epoch = -1
     starting_epoch = 0
-    best_acc = torch.tensor(0)
-    best_class = []
-    # # 尝试加载预训练模型
-    # model = load_pretrain_model(f"{os.getcwd()}/model_store/{config.finetune.checkpoint}/best/pytorch_model.bin", model,
-    #                             accelerator)
+    train_step = 0
+    val_step = 0
 
-    # 尝试继续训练
-    if config.trainer.resume:
-        model, optimizer, scheduler, starting_epoch, train_step, best_acc, best_class = utils.resume_train_state(model, '{}'.format(
-            config.finetune.checkpoint), optimizer, scheduler, train_loader, accelerator)
-        val_step = train_step
-        
-    model, optimizer, scheduler, train_loader, val_loader = accelerator.prepare(model, optimizer, scheduler,
-                                                                                train_loader, val_loader)
-    best_acc = best_acc.to(accelerator.device)
+    resume_from = config.trainer.resume_from
+    if resume_from:
+        resume_dir = os.path.join(os.getcwd(), "model_store", resume_from, "checkpoint")
+        if os.path.isdir(resume_dir):
+            accelerator.print(f"Resuming from {resume_dir}")
+            accelerator.load_state(resume_dir)
+            metadata_path = os.path.join(resume_dir, "epoch.pth.tar")
+            if os.path.exists(metadata_path):
+                saved_state = torch.load(metadata_path, map_location="cpu")
+                starting_epoch = int(saved_state.get("epoch", -1)) + 1
+                best_acc = float(saved_state.get("best_acc", 0.0))
+                best_metrics = saved_state.get("best_metrics", {})
+                best_epoch = int(saved_state.get("best_epoch", starting_epoch - 1))
+                train_step = starting_epoch * len(train_loader)
+                val_step = train_step
 
-    # 开始训练
-    accelerator.print("Start Training！")
+    accelerator.print("Start training!")
+    num_epochs = config.trainer.num_epochs
 
-    for epoch in range(starting_epoch, config.trainer.num_epochs):
-        # 训练
-        step = train_one_epoch(model, loss_functions, train_loader,
-                               optimizer, scheduler, metrics,
-                               post_trans, accelerator, epoch, step)
-        # 验证
-        mean_acc, batch_acc, val_step = val_one_epoch(model, loss_functions, inference, val_loader,
-                                                      config, metrics, val_step,
-                                                      post_trans, accelerator, epoch)
+    for epoch in range(starting_epoch, num_epochs):
+        train_step, train_loss, train_accuracy = train_one_epoch(
+            model, train_loader, optimizer, loss_fn, accelerator, epoch, train_step, num_epochs
+        )
 
-        # 保存模型
-        if mean_acc > best_acc:
-            accelerator.save_state(output_dir=f"{os.getcwd()}/model_store/{config.finetune.checkpoint}/best")
-            best_acc = mean_acc
-            best_class = batch_acc
-            best_eopch = epoch
-        accelerator.print('Cheakpoint...')
-        accelerator.save_state(output_dir=f"{os.getcwd()}/model_store/{config.finetune.checkpoint}/checkpoint")
-        torch.save({'epoch': epoch, 'best_acc': best_acc, 'best_class': batch_acc},
-                   f'{os.getcwd()}/model_store/{config.finetune.checkpoint}/checkpoint/epoch.pth.tar')
-        
-        
-        accelerator.print(
-            f'Epoch [{epoch + 1}/{config.trainer.num_epochs}] best acc:{best_acc}, Now : mean acc: {mean_acc}, mean class: {batch_acc}')
+        scheduler.step()
+        accelerator.log({"Train/LR": optimizer.param_groups[0]["lr"]}, step=epoch)
 
+        val_accuracy, val_metrics, val_step = validate(
+            model, val_loader, loss_fn, accelerator, epoch, val_step, num_epochs
+        )
 
-    accelerator.print(f"best acc: {best_acc}")
-    accelerator.print(f"best class : {best_class}")
-    accelerator.print(f"best epochs: {best_eopch}")
-    sys.exit(1)
+        if val_accuracy > best_acc:
+            accelerator.print(
+                f"New best accuracy: {val_accuracy:.4%} (previous {best_acc:.4%}) at epoch {epoch + 1}"
+            )
+            accelerator.save_state(best_dir)
+            best_acc = val_accuracy
+            best_metrics = val_metrics
+            best_epoch = epoch
+
+        accelerator.print("Checkpointing...")
+        accelerator.save_state(checkpoint_dir)
+        if accelerator.is_main_process:
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "best_acc": best_acc,
+                    "best_metrics": best_metrics,
+                    "best_epoch": best_epoch,
+                },
+                os.path.join(checkpoint_dir, "epoch.pth.tar"),
+            )
+
+    accelerator.print(f"Best accuracy: {best_acc:.4%} at epoch {best_epoch + 1 if best_epoch >= 0 else 'N/A'}")
+    accelerator.print(f"Best metrics: {best_metrics}")
+    accelerator.end_training()
+    sys.exit(0)
