@@ -1,0 +1,150 @@
+def get_mask_visualization(model: torch.nn.Module, output_path, accelerator, val_loader: torch.utils.data.DataLoader, 
+                           test_loader: torch.utils.data.DataLoader, inference: monai.inferers.Inferer):  
+    if not os.path.exists(output_path):
+        os.makedirs(output_path) 
+    else:
+        shutil.rmtree(output_path)
+        os.makedirs(output_path) 
+    # 获取数据
+    
+    for i, (image_batch, test_batch) in enumerate(zip(val_loader, test_loader)):
+        logits = inference(image_batch[0], model)
+        logits = post_trans(logits)
+        or_size = (test_batch[1].size()[-2], test_batch[1].size()[-1])
+        original_image = transforms.ToPILImage()(test_batch[0][0].cpu())
+        channel_colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0), (255, 0, 255)]
+        file_name, file_ext = os.path.splitext(os.path.basename(test_batch[0]['image_meta_dict']['filename_or_obj'][0]))
+        for channel in range(logits.shape[1]):
+            channel_output = logits[:, channel, :, :]
+            channel_output = F.interpolate(channel_output, size=or_size, mode='nearest')
+            mask_array = channel_output.cpu().squeeze().numpy() * 255
+            mask_image = Image.fromarray(mask_array).convert('L')
+            # channel_output_path = output_path + f'/{file_name}_channel{channel+1}.tif'
+            # if channel == 0:
+            #     channel_output_path = output_path + f'/{file_name}_BE.tif'
+            # elif channel == 1:
+            #     channel_output_path = output_path + f'/{file_name}_cancer.tif'
+            # elif channel == 2:
+            #     channel_output_path = output_path + f'/{file_name}_HGD.tif'
+            # elif channel == 3:
+            #     channel_output_path = output_path + f'/{file_name}_polyp.tif'
+            # elif channel == 4:
+            #     channel_output_path = output_path + f'/{file_name}_suspicious.tif'
+            # else :
+            #     print(f'{file_name}{file_ext} error map has been visualizated!')
+            # mask_image.save(channel_output_path)
+            # accelerator.print(output_path + f'/{file_name}{file_ext}' + ' has been saved!')
+            error_map = np.zeros_like(mask_image, dtype=np.uint8)
+            interest_mask = mask_image == 255
+            error_map[interest_mask] = channel_colors[channel]
+            overlayed_image = cv2.addWeighted(original_image, 0.7, error_map, 0.3, 0)
+            # colored_mask_image = Image.new("RGB", mask_image.size)
+            # colored_mask_image.putdata([(channel_colors[channel])] * mask_image.size[0] * mask_image.size[1])
+            # colored_mask_image.paste(mask_image, (0, 0), mask_image)
+            # channel_output_path = os.path.join(output_path, f'{file_name}_channel{channel+1}{file_ext}')
+            # colored_mask_image.save(channel_output_path)
+            # accelerator.print(f'{file_name}_channel{channel+1}{file_ext} has been saved!')
+
+            # Overlay the colored mask on the original image
+            # original_image = Image.blend(original_image, colored_mask_image, alpha=0.5)
+            
+        # Save the overlaid image
+        overlayed_output_path = os.path.join(output_path, f'{file_name}_overlay_channel{channel+1}{file_ext}')
+        overlayed_image.save(overlayed_output_path)
+            
+        accelerator.print(f'{file_name}_overlay_channel{channel+1}{file_ext} has been saved!')
+            
+            # if os.path.exists(file_path2):
+            # print(f"Found matching file: {file_path1} and {file_path_gt} and {file_path2} and get filename:{file_name}{file_ext}")
+        #     img_path = file_path1
+        #     mask_path = file_path2
+        #     gt_path = file_path_gt
+        #     output_p = f'{output_path}/{file_name}_overlayed.png'
+
+        #     input_image = imageio.imread(img_path)
+        #     logits = inference(give_input(img_path)[0].to(accelerator.device), model)
+        #     logits = post_trans(logits)
+        #     logits = F.interpolate(logits, size=give_input(img_path)[1], mode='nearest').squeeze(0)
+
+        #     # 初始化一个三通道的图像
+        #     result_image = np.zeros((logits.shape[1], logits.shape[2], 3), dtype=np.uint8)
+
+        #     # 遍历每个通道
+        #     for channel in range(logits.shape[0]):
+        #         # 获取当前通道的输出，并映射到颜色通道
+        #         channel_output = logits[channel, :, :].cpu().numpy() * 255
+        #         channel_color = np.zeros((logits.shape[1], logits.shape[2], 3), dtype=np.uint8)
+
+        #         # 分别映射通道到不同颜色通道
+        #         if channel == 0:
+        #             channel_color[:, :, 0] = channel_output.astype(np.uint8)  # 红色
+        #         elif channel == 1:
+        #             channel_color[:, :, 1] = channel_output.astype(np.uint8)  # 绿色
+        #         elif channel == 2:
+        #             channel_color[:, :, 2] = channel_output.astype(np.uint8)  # 蓝色
+        #         elif channel == 3:
+        #             channel_color[:, :, 0] = channel_output.astype(np.uint8)  # 青色
+        #             channel_color[:, :, 1] = channel_output.astype(np.uint8)
+        #         elif channel == 4:
+        #             channel_color[:, :, 1] = channel_output.astype(np.uint8)  # 黄色
+        #             channel_color[:, :, 2] = channel_output.astype(np.uint8)
+
+        #         # 将当前通道叠加到总的结果图像上
+        #         result_image = cv2.add(result_image, channel_color)
+
+        #     # 保存叠加结果为一张图像文件
+        #     overlayed_image = Image.fromarray(result_image)
+        #     overlayed_image.save(output_p)
+
+        #     print(f'{file_name}{file_ext} has been visualized and saved!')
+        # else:
+        #     print(f'Cannot find the file: {file_name}{file_ext}')
+
+
+
+
+  # if os.path.exists(file_path2):
+            # print(f"Found matching file: {file_path1} and {file_path_gt} and {file_path2} and get filename:{file_name}{file_ext}")
+        #     img_path = file_path1
+        #     mask_path = file_path2
+        #     gt_path = file_path_gt
+        #     output_p = f'{output_path}/{file_name}_overlayed.png'
+
+        #     input_image = imageio.imread(img_path)
+        #     logits = inference(give_input(img_path)[0].to(accelerator.device), model)
+        #     logits = post_trans(logits)
+        #     logits = F.interpolate(logits, size=give_input(img_path)[1], mode='nearest').squeeze(0)
+
+        #     # 初始化一个三通道的图像
+        #     result_image = np.zeros((logits.shape[1], logits.shape[2], 3), dtype=np.uint8)
+
+        #     # 遍历每个通道
+        #     for channel in range(logits.shape[0]):
+        #         # 获取当前通道的输出，并映射到颜色通道
+        #         channel_output = logits[channel, :, :].cpu().numpy() * 255
+        #         channel_color = np.zeros((logits.shape[1], logits.shape[2], 3), dtype=np.uint8)
+
+        #         # 分别映射通道到不同颜色通道
+        #         if channel == 0:
+        #             channel_color[:, :, 0] = channel_output.astype(np.uint8)  # 红色
+        #         elif channel == 1:
+        #             channel_color[:, :, 1] = channel_output.astype(np.uint8)  # 绿色
+        #         elif channel == 2:
+        #             channel_color[:, :, 2] = channel_output.astype(np.uint8)  # 蓝色
+        #         elif channel == 3:
+        #             channel_color[:, :, 0] = channel_output.astype(np.uint8)  # 青色
+        #             channel_color[:, :, 1] = channel_output.astype(np.uint8)
+        #         elif channel == 4:
+        #             channel_color[:, :, 1] = channel_output.astype(np.uint8)  # 黄色
+        #             channel_color[:, :, 2] = channel_output.astype(np.uint8)
+
+        #         # 将当前通道叠加到总的结果图像上
+        #         result_image = cv2.add(result_image, channel_color)
+
+        #     # 保存叠加结果为一张图像文件
+        #     overlayed_image = Image.fromarray(result_image)
+        #     overlayed_image.save(output_p)
+
+        #     print(f'{file_name}{file_ext} has been visualized and saved!')
+        # else:
+        #     print(f'Cannot find the file: {file_name}{file_ext}')
