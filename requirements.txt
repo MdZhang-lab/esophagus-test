@@ -4,4 +4,5 @@ opencv-python==4.8.1.78
 timm==0.9.7
 objprint==0.2.3
 einops
+pandas
 torch
